@@ -12,25 +12,61 @@ from copy import deepcopy
 from datasets import load_dataset
 from reward_func import *
 import wandb
+
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
+SYSTEM_PROMPT = "Let's think step by step and output the final answer within \\boxed{}."
 
 class GSM8KDataset(Dataset):
-    def __init__(self, data_path, tokenizer):
+    def __init__(self, data_path, tokenizer, filter_dataset_by_len=True, grpo_args=None):
         
         self.tokenizer = tokenizer
         data = load_dataset(data_path)
         self.data = data['train']
+        
+        # Filter dataset by length if enabled
+        if filter_dataset_by_len and grpo_args is not None:
+            print(f"Original dataset size: {len(self.data)}")
+            filtered_data = []
+            
+            for sample in self.data:
+                # Get prompt and answer
+                prompt = sample["question"]
+                answer = sample["answer"]
+                
+                # Apply the same chat template as in training to get accurate length
+                input_text = self.tokenizer.apply_chat_template(
+                    [{"role": "system", 'content': SYSTEM_PROMPT}, 
+                     {"role": "user", 'content': prompt}], 
+                    add_generation_prompt=True, 
+                    tokenize=False
+                )
+                
+                # Tokenize to check actual length after chat template
+                prompt_tokens = self.tokenizer.encode(input_text, add_special_tokens=False)
+                
+                # Filter based on max lengths - keep only if it won't be truncated
+                if (len(prompt_tokens) <= grpo_args.max_prompt_length):
+                    filtered_data.append(sample)
+            
+            self.data = filtered_data
+            print(f"Filtered dataset size: {len(self.data)}")
+            print(f"Filtered out: {len(data['train']) - len(self.data)} samples")
+            if len(self.data) > 0:
+                print(f"Retention rate: {len(self.data) / len(data['train']) * 100:.2f}%")
   
     def __len__(self):
         return len(self.data)
+    
+    
     
     def __getitem__(self, index):
         sample = self.data[index]
         # prompt = self.tokenizer.apply_chat_template(sample['prompt'], tokenize=False, add_generation_prompt=True)
         answer = sample['answer_only']
-        prompt = sample['question_zh']
+        # prompt = sample['question_zh']
+        prompt = sample['question']
         return {'prompt': prompt, 'answer': answer}
 
 
@@ -50,19 +86,19 @@ class GRPOArguments:
     
     output_dir = './output'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    lr = 0.000001
+    lr = 1e-6
     save_steps = 100
     epoch = 3
     num_generations = 4 # 组内样本数
-    max_prompt_length = 256 # 最大输入长度
-    max_generate_length = 256 # 最大输出长度
+    max_prompt_length = 512 # 最大输入长度
+    max_generate_length = 1024 # 最大输出长度
     reward_weights : List[float] = None # 奖励的权重（多个奖励函数）
-    beta = 0.0 # KL散度的系数，为0则忽略KL散度，即不使用参考模型
+    beta = 1e-2 # KL散度的系数，为0则忽略KL散度，即不使用参考模型
     clip_eps = 0.2
     gradient_accumulation_steps = 2 # 梯度累加
     num_iterations = 1 # 采样一次样本训练模型轮数
     batch_size = 1
-    use_wandb = True # 是否使用wandb记录
+    use_wandb = False # 是否使用wandb记录
     wandb_project = "grpo-training" # wandb项目名称
     wandb_run_name = None # wandb运行名称，默认自动生成
 
@@ -93,7 +129,6 @@ class GRPOTrainer:
             tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         
         self.tokenizer = self.get_tokenizer(tokenizer)
-        
         
         if isinstance(reward_funcs, str):
             reward_funcs = [reward_funcs]
@@ -158,7 +193,7 @@ class GRPOTrainer:
         tokenizer.padding_side = "left"
         return tokenizer
     
-    # 生成样本，以组为单位
+    # Generate samples for each prompt in the inputs
     def generate_samples(self, inputs):
         samples_list = []
         self.model.eval()
@@ -170,30 +205,38 @@ class GRPOTrainer:
         
         max_length = self.args.max_generate_length + self.args.max_prompt_length
         for prompt, answer in zip(prompts, answers):
-            # 应用聊天模板，加入系统提示词
+            # For each prompt, generate a group of samples
+            
+            # Apply chat template with system prompt
             input_text = self.tokenizer.apply_chat_template([{"role": "system", 'content': SYSTEM_PROMPT}, {"role": "user", 'content': prompt}], add_generation_prompt=True, tokenize=False)
             
-            # 生成一个group的输入数据
+            # Generate input data for a group
             inputs = self.tokenizer([input_text] * self.args.num_generations, padding='max_length', max_length=self.args.max_prompt_length, truncation=True, return_tensors='pt')
+            
             prompt_ids = inputs['input_ids']
+            
             with torch.no_grad():
-                prompt_response_ids = self.model.generate(**inputs.to(self.args.device), 
-                                    max_new_tokens = self.args.max_generate_length,
-                                    temperature=0.9,
-                                    top_p = 1,
-                                    top_k = 50)
+                prompt_response_ids = self.model.generate(
+                    **inputs.to(self.args.device), 
+                    max_new_tokens = self.args.max_generate_length,
+                    temperature=0.9,
+                    top_p = 1,
+                    top_k = 50)
                 
             if prompt_response_ids.size(1) >= max_length:
                 prompt_response_ids = prompt_response_ids[:, :max_length]
             else:
+                # Pad sequences to max_length
                 prompt_response_ids = torch.cat([prompt_response_ids, torch.full((prompt_response_ids.size(0), max_length - prompt_response_ids.size(1)), fill_value=self.tokenizer.pad_token_id, device=prompt_response_ids.device)], dim=1)
           
             attention_mask = (prompt_response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
+            
+            # [B, max gen tokens]
             response_ids = prompt_response_ids[:, prompt_ids.size(1):]
             action_mask = (response_ids.ne(self.tokenizer.eos_token_id) & response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
         
 
-            # 存储的是一个group的数据
+            # Create Samples dataclass instance
             samples = Samples(
                 prompt_response_ids=prompt_response_ids,
                 response_ids=response_ids,
@@ -292,10 +335,10 @@ class GRPOTrainer:
                         }, step=self.update_steps)
                     
                     wandb.log({
-                        'rewards/total_mean': mean_group_rewards.item(),
-                        'rewards/total_std': std_group_rewards.item(),
-                        'rewards/total_max': rewards.max().item(),
-                        'rewards/total_min': rewards.min().item(),
+                        'rewards_total/total_mean': mean_group_rewards.item(),
+                        'rewards_total/total_std': std_group_rewards.item(),
+                        'rewards_total/total_max': rewards.max().item(),
+                        'rewards_total/total_min': rewards.min().item(),
                     }, step=self.update_steps)
                 
                 # GRPO的优势是句子粒度的，而非token粒度的
@@ -314,11 +357,18 @@ class GRPOTrainer:
     
     def compute_loss(self, model, inputs):
         
+        # [B, max prompt len + max gen len]
         prompt_response_ids = inputs['prompt_response_ids']
         attention_mask = inputs['attention_mask']
+        
+        # [B, max gen len]
         action_mask = inputs['action_mask']
+        
         num_actions = action_mask.size(1)
+        
+        # [B, max gen len]
         action_log_probs = self.get_action_log_probs(model, prompt_response_ids, attention_mask, num_actions)
+        
         
         if self.args.beta != 0.0:
             
@@ -329,13 +379,15 @@ class GRPOTrainer:
             # k3: log_ratio.exp() - 1 - log_ratio
             k3 = log_ratio.exp() - 1 - log_ratio
         
+        # [B]
         advantages = inputs['advantages']
         
         old_action_log_probs = inputs['old_action_log_probs'] if self.args.num_iterations > 1 else action_log_probs.detach()
-        coef_1 = torch.exp(action_log_probs - old_action_log_probs) # 重要性采样 shape: [batch_size * num_generations, num_actions]
+        coef_1 = torch.exp(action_log_probs - old_action_log_probs) # Importance Sampling shape: [batch_size * num_generations, num_actions]
         coef_2 = torch.clamp(coef_1, 1 - self.args.clip_eps, 1 + self.args.clip_eps)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1) # 一个序列中每个token的优势是一样的
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1) 
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         per_token_loss = per_token_loss * action_mask
         if self.args.beta != 0.0:
@@ -343,9 +395,7 @@ class GRPOTrainer:
         
         loss = per_token_loss.sum(dim=1) / action_mask.sum(dim=1) # shape: [batch_size * num_generations]
         loss = loss.mean()
-        
-        # loss = per_token_loss.sum() / action_mask.sum()
-        
+
         return loss
 
 
@@ -390,13 +440,15 @@ class GRPOTrainer:
 
     def train(self):
         self.global_steps = self.args.num_iterations * self.args.epoch * len(self.train_dataset) // (self.args.batch_size * self.args.gradient_accumulation_steps)
+        
         for _ in range(self.args.epoch):
-            
             dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True)
+            
             for idx, batch in enumerate(dataloader):
-                
+                # sample answers for each question in the batch
                 inputs = self.generate_experiences(batch)
                 self.input_buffer[idx % self.args.gradient_accumulation_steps] = inputs
+                
                 if (idx + 1) % self.args.gradient_accumulation_steps == 0:
                    
                     for _ in range(self.args.num_iterations):
@@ -419,36 +471,24 @@ class GRPOTrainer:
             wandb.finish()           
 
 if __name__ == "__main__":
-        
-    SYSTEM_PROMPT = """
-按照如下格式回答问题：
-<think>
-你的思考过程
-</think>
-<answer>
-你的回答
-</answer>
-"""
-    
+
     args = GRPOArguments()
+
+    # model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     
-    # writer = SummaryWriter('./runs')
-    # 策略模型
-    
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
-    # 奖励函数
-    # reward_model = '/home/user/Downloads/reward-model-deberta-v3-large-v2'
-    # reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
     
     dataset_name = "meta-math/GSM8K_zh"
     
-    prompts_dataset = GSM8KDataset(dataset_name, tokenizer)
+    prompts_dataset = GSM8KDataset(dataset_name, tokenizer, filter_dataset_by_len=True, grpo_args=args)
+    
+    reward_func_list = [boxed_correctness_reward, boxed_format_reward]
   
     trainer = GRPOTrainer(model=model,
-                          reward_funcs = [correctness_reward, digit_reward, hard_format_reward, mark_reward],
+                          reward_funcs = reward_func_list,
                           args=args,
                           train_dataset=prompts_dataset,
                           tokenizer=tokenizer)
