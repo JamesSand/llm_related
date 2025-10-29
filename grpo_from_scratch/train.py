@@ -6,11 +6,12 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from copy import deepcopy
 from datasets import load_dataset
 from reward_func import *
+import wandb
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
@@ -29,7 +30,7 @@ class GSM8KDataset(Dataset):
         sample = self.data[index]
         # prompt = self.tokenizer.apply_chat_template(sample['prompt'], tokenize=False, add_generation_prompt=True)
         answer = sample['answer_only']
-        prompt = sample['question_zh-cn']
+        prompt = sample['question_zh']
         return {'prompt': prompt, 'answer': answer}
 
 
@@ -61,6 +62,9 @@ class GRPOArguments:
     gradient_accumulation_steps = 2 # 梯度累加
     num_iterations = 1 # 采样一次样本训练模型轮数
     batch_size = 1
+    use_wandb = True # 是否使用wandb记录
+    wandb_project = "grpo-training" # wandb项目名称
+    wandb_run_name = None # wandb运行名称，默认自动生成
 
 class GRPOTrainer:
     def __init__(self,
@@ -130,7 +134,26 @@ class GRPOTrainer:
         self.input_buffer = [None] * self.args.gradient_accumulation_steps
         
         # 模型更新的次数
-        self.update_steps = 0 
+        self.update_steps = 0
+        
+        # 初始化wandb
+        if self.args.use_wandb:
+            wandb.init(
+                project=self.args.wandb_project,
+                name=self.args.wandb_run_name,
+                config={
+                    "learning_rate": self.args.lr,
+                    "epochs": self.args.epoch,
+                    "batch_size": self.args.batch_size,
+                    "num_generations": self.args.num_generations,
+                    "max_prompt_length": self.args.max_prompt_length,
+                    "max_generate_length": self.args.max_generate_length,
+                    "beta": self.args.beta,
+                    "clip_eps": self.args.clip_eps,
+                    "gradient_accumulation_steps": self.args.gradient_accumulation_steps,
+                    "num_iterations": self.args.num_iterations,
+                }
+            ) 
     def get_tokenizer(self, tokenizer):
         tokenizer.padding_side = "left"
         return tokenizer
@@ -257,6 +280,24 @@ class GRPOTrainer:
                 mean_group_rewards = rewards.mean()
                 std_group_rewards = rewards.std()
                 
+                # 记录奖励到wandb
+                if self.args.use_wandb:
+                    reward_func_names = ['correctness', 'digit', 'hard_format', 'mark']
+                    for i in range(len(self.reward_funcs)):
+                        func_name = reward_func_names[i] if i < len(reward_func_names) else f'reward_{i}'
+                        wandb.log({
+                            f'rewards/{func_name}_mean': rewards_per_func[i].mean().item(),
+                            f'rewards/{func_name}_max': rewards_per_func[i].max().item(),
+                            f'rewards/{func_name}_min': rewards_per_func[i].min().item(),
+                        }, step=self.update_steps)
+                    
+                    wandb.log({
+                        'rewards/total_mean': mean_group_rewards.item(),
+                        'rewards/total_std': std_group_rewards.item(),
+                        'rewards/total_max': rewards.max().item(),
+                        'rewards/total_min': rewards.min().item(),
+                    }, step=self.update_steps)
+                
                 # GRPO的优势是句子粒度的，而非token粒度的
                 advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
                 batch_advantages.append(advantages)
@@ -336,7 +377,14 @@ class GRPOTrainer:
             # scaler.step(optimizer)
             # scaler.update()
         
-            writer.add_scalar("grpo_loss", loss.item(), self.update_steps)
+            # 记录到wandb
+            if self.args.use_wandb:
+                wandb.log({
+                    'train/loss': loss.item() * self.args.gradient_accumulation_steps,
+                    'train/learning_rate': self.args.lr,
+                    'train/step': self.update_steps,
+                }, step=self.update_steps)
+            
             print(f"step: {self.update_steps}/{self.global_steps}  grpo_loss: {loss.item():.8f}")
         torch.cuda.empty_cache()
 
@@ -361,14 +409,17 @@ class GRPOTrainer:
                             self.tokenizer.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
                         
                 del inputs
+                
     def save_model(self):
         self.model.save_pretrained(self.args.output_dir)
-        self.tokenizer.save_pretrained(self.args.output_dir)           
+        self.tokenizer.save_pretrained(self.args.output_dir)
+        
+        # 结束wandb运行
+        if self.args.use_wandb:
+            wandb.finish()           
 
 if __name__ == "__main__":
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = '2'
-    
+        
     SYSTEM_PROMPT = """
 按照如下格式回答问题：
 <think>
@@ -381,18 +432,20 @@ if __name__ == "__main__":
     
     args = GRPOArguments()
     
-    writer = SummaryWriter('./runs')
+    # writer = SummaryWriter('./runs')
     # 策略模型
-    tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/Qwen2.5-1.5B-Instruct')
-    model = AutoModelForCausalLM.from_pretrained('/home/user/Downloads/Qwen2.5-1.5B-Instruct')
+    
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
     # 奖励函数
     # reward_model = '/home/user/Downloads/reward-model-deberta-v3-large-v2'
     # reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
     
-
+    dataset_name = "meta-math/GSM8K_zh"
     
-    
-    prompts_dataset = GSM8KDataset('/home/user/wyf/deepseek_learn/gsm8k_chinese', tokenizer)
+    prompts_dataset = GSM8KDataset(dataset_name, tokenizer)
   
     trainer = GRPOTrainer(model=model,
                           reward_funcs = [correctness_reward, digit_reward, hard_format_reward, mark_reward],
